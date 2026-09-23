@@ -1,0 +1,11 @@
+.venv/
+.venv-spark/
+.jdk/
+data/
+.DS_Store
+__pycache__/
+*.pyc
+metastore_db/
+spark-warehouse/
+.ivy2/
+.ipynb_checkpoints/
