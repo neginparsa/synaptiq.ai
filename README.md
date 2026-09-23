@@ -1,9 +1,5 @@
 # Online Retail II — Databricks EDA
 
-Single interview notebook. Open this repo as a Databricks Git folder, then run `notebooks/online_retail_ii_eda.py` top to bottom.
+One interview notebook: `notebooks/online_retail_ii_eda.py`.
 
-- Engine: PySpark + Spark SQL
-- Charts/tables: Databricks `display()`
-- Data: UCI Online Retail II (downloaded in the first code cell if not already present)
-
-No pipelines, no medallion layers, no models.
+Set the `table_name` widget to the table that already holds the dataset (both year tabs, including `source_sheet`). Run top to bottom.
