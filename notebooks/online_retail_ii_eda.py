@@ -19,45 +19,96 @@
 # MAGIC %md
 # MAGIC ## Setup
 # MAGIC
-# MAGIC Raw file lives on a **Volume**. The notebook reads a **table**.
+# MAGIC All Unity Catalog objects this notebook needs are created here if they are missing:
 # MAGIC
-# MAGIC - Volume file: `/Volumes/workspace/default/my_files/online_retail/online_retail_ii.parquet`  
-# MAGIC   (same data as `online_retail_II.xlsx`, both year tabs, plus `source_sheet`)
-# MAGIC - Table: `workspace.default.online_retail_ii` in the existing `workspace.default` schema — we do not create a new schema.
+# MAGIC 1. Schema `workspace.default`
+# MAGIC 2. Volume `workspace.default.my_files` (raw files)
+# MAGIC 3. Table `workspace.default.online_retail_ii` (both year tabs + `source_sheet`)
 # MAGIC
-# MAGIC `Customer ID` has a space, so the table is created with Delta column mapping. If the table already exists, the create step is skipped.
+# MAGIC Later, §10 writes the small dashboard tables into the same schema. We do not create Bronze/Silver/Gold schemas.
+# MAGIC
+# MAGIC Upload the parquet or Excel under the volume path before the first run if the table does not exist. `Customer ID` has a space, so the source table uses Delta column mapping.
 
 # COMMAND ----------
+
+from pathlib import Path
 
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
 
+dbutils.widgets.text("catalog_name", "workspace")
+dbutils.widgets.text("schema_name", "default")
+dbutils.widgets.text("volume_name", "my_files")
 dbutils.widgets.text("table_name", "workspace.default.online_retail_ii")
 dbutils.widgets.text(
     "volume_parquet",
     "/Volumes/workspace/default/my_files/online_retail/online_retail_ii.parquet",
 )
+dbutils.widgets.text(
+    "volume_xlsx",
+    "/Volumes/workspace/default/my_files/online_retail/online_retail_II.xlsx",
+)
 
+CATALOG = dbutils.widgets.get("catalog_name")
+SCHEMA = dbutils.widgets.get("schema_name")
+VOLUME = dbutils.widgets.get("volume_name")
 TABLE = dbutils.widgets.get("table_name")
 VOLUME_PARQUET = dbutils.widgets.get("volume_parquet")
+VOLUME_XLSX = dbutils.widgets.get("volume_xlsx")
+UC_SCHEMA = f"{CATALOG}.{SCHEMA}"
+UC_VOLUME = f"{CATALOG}.{SCHEMA}.{VOLUME}"
 
-if not spark.catalog.tableExists(TABLE):
+spark.sql(f"CREATE SCHEMA IF NOT EXISTS {UC_SCHEMA}")
+spark.sql(f"CREATE VOLUME IF NOT EXISTS {UC_VOLUME}")
+print("schema:", UC_SCHEMA)
+print("volume:", UC_VOLUME)
+
+
+def _create_source_table():
     # Column mapping: Delta otherwise rejects the space in `Customer ID`.
-    spark.sql(
-        f"""
-        CREATE TABLE {TABLE}
+    ddl_props = """
         TBLPROPERTIES (
           'delta.minReaderVersion' = '2',
           'delta.minWriterVersion' = '5',
           'delta.columnMapping.mode' = 'name'
         )
-        AS
-        SELECT * FROM read_files('{VOLUME_PARQUET}', format => 'parquet')
-        """
+    """
+    if Path(VOLUME_PARQUET).exists():
+        spark.sql(
+            f"""
+            CREATE TABLE {TABLE}
+            {ddl_props}
+            AS
+            SELECT * FROM read_files('{VOLUME_PARQUET}', format => 'parquet')
+            """
+        )
+        print("created", TABLE, "from", VOLUME_PARQUET)
+        return
+    if Path(VOLUME_XLSX).exists():
+        import pandas as pd
+
+        frames = []
+        for sheet in ["Year 2009-2010", "Year 2010-2011"]:
+            part = pd.read_excel(
+                VOLUME_XLSX,
+                sheet_name=sheet,
+                dtype={"Invoice": str, "StockCode": str, "Description": str, "Country": str},
+            )
+            part["source_sheet"] = sheet
+            frames.append(part)
+        spark.createDataFrame(pd.concat(frames, ignore_index=True)).createOrReplaceTempView("_src")
+        spark.sql(f"CREATE TABLE {TABLE} {ddl_props} AS SELECT * FROM _src")
+        print("created", TABLE, "from", VOLUME_XLSX)
+        return
+    raise FileNotFoundError(
+        f"Upload the dataset to {VOLUME_PARQUET} or {VOLUME_XLSX}, then re-run Setup."
     )
-    print("created", TABLE, "from", VOLUME_PARQUET)
-else:
+
+
+if spark.catalog.tableExists(TABLE):
     print("using existing", TABLE)
+else:
+    _create_source_table()
 
 raw = spark.table(TABLE)
 raw.createOrReplaceTempView("retail_raw")
@@ -768,7 +819,7 @@ display(spark.sql(
 # MAGIC | `dashboard_geography_ex_uk` | Bar for the chart only — UK removed so the tail is readable |
 # MAGIC | `dashboard_monthly_returns` | Line: x=month, y=return_rate (percent). Built from two monthly aggregates, then joined. |
 # MAGIC
-# MAGIC After this cell runs, build the Databricks dashboard from these result tables. Do not type KPI numbers by hand.
+# MAGIC After this cell runs, the same result sets are written as tables in `workspace.default` (the schema created in Setup). Point the Databricks dashboard at those tables. Do not type KPI numbers by hand.
 
 # COMMAND ----------
 
@@ -911,6 +962,21 @@ spark.sql(
     ORDER BY month
     """
 )
+
+# Persist the same result sets as tables in the schema created in Setup.
+# These are consumption copies of the temp views, not a second metric layer.
+DASHBOARD_TABLES = [
+    "dashboard_kpis",
+    "dashboard_monthly_revenue",
+    "dashboard_top_products",
+    "dashboard_top_customers",
+    "dashboard_geography",
+    "dashboard_geography_ex_uk",
+    "dashboard_monthly_returns",
+]
+for name in DASHBOARD_TABLES:
+    spark.sql(f"CREATE OR REPLACE TABLE {UC_SCHEMA}.{name} AS SELECT * FROM {name}")
+    print("wrote", f"{UC_SCHEMA}.{name}")
 
 print("dashboard views ready")
 display(spark.table("dashboard_kpis"))
