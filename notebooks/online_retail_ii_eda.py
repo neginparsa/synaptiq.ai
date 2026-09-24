@@ -1029,16 +1029,16 @@ display(spark.sql(
         (SELECT SUM(line_revenue) FROM trade WHERE `Customer ID` IS NOT NULL) AS identified_net
     )
     SELECT stack(10,
-      'net merchandise revenue',        nb.merch_net,              dash.merch_net,
-      'gross merchandise revenue',      nb.merch_gross,            dash.merch_gross,
-      'return / credit value',          nb.merch_returns,          dash.merch_returns,
-      'sale invoices',                  nb.sale_invoices,          dash.sale_invoices,
-      'identified customers',           nb.identified_customers,   dash.identified_customers,
-      'monthly net sums to trade net',  nb.merch_net,              dash.monthly_net,
-      'monthly gross sums to sales',    nb.merch_gross,            dash.monthly_gross,
-      'monthly returns sum to credits', nb.merch_returns,          dash.monthly_returns,
-      'geography sums to sales',        nb.merch_gross,            dash.geo_sales,
-      'non-UK geography vs non-UK sales', nb.sales_ex_uk,       dash.geo_ex_uk
+      'net merchandise revenue',        CAST(nb.merch_net AS DOUBLE),              CAST(dash.merch_net AS DOUBLE),
+      'gross merchandise revenue',      CAST(nb.merch_gross AS DOUBLE),            CAST(dash.merch_gross AS DOUBLE),
+      'return / credit value',          CAST(nb.merch_returns AS DOUBLE),          CAST(dash.merch_returns AS DOUBLE),
+      'sale invoices',                  CAST(nb.sale_invoices AS DOUBLE),          CAST(dash.sale_invoices AS DOUBLE),
+      'identified customers',           CAST(nb.identified_customers AS DOUBLE),   CAST(dash.identified_customers AS DOUBLE),
+      'monthly net sums to trade net',  CAST(nb.merch_net AS DOUBLE),              CAST(dash.monthly_net AS DOUBLE),
+      'monthly gross sums to sales',    CAST(nb.merch_gross AS DOUBLE),            CAST(dash.monthly_gross AS DOUBLE),
+      'monthly returns sum to credits', CAST(nb.merch_returns AS DOUBLE),          CAST(dash.monthly_returns AS DOUBLE),
+      'geography sums to sales',        CAST(nb.merch_gross AS DOUBLE),            CAST(dash.geo_sales AS DOUBLE),
+      'non-UK geography vs non-UK sales', CAST(nb.sales_ex_uk AS DOUBLE),           CAST(dash.geo_ex_uk AS DOUBLE)
     ) AS (metric, notebook_value, dashboard_value)
     FROM nb CROSS JOIN dash
     """
