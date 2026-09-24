@@ -19,7 +19,13 @@
 # MAGIC %md
 # MAGIC ## Setup
 # MAGIC
-# MAGIC Point the widget at the table that already holds both source years. Expected columns include `Invoice`, `StockCode`, `Description`, `Quantity`, `InvoiceDate`, `Price` (or `UnitPrice`), `Customer ID`, `Country`, and `source_sheet` (which year-tab the row came from).
+# MAGIC Raw file lives on a **Volume**. The notebook reads a **table**.
+# MAGIC
+# MAGIC - Volume file: `/Volumes/workspace/default/my_files/online_retail/online_retail_ii.parquet`  
+# MAGIC   (same data as `online_retail_II.xlsx`, both year tabs, plus `source_sheet`)
+# MAGIC - Table: `workspace.default.online_retail_ii` in the existing `workspace.default` schema — we do not create a new schema.
+# MAGIC
+# MAGIC `Customer ID` has a space, so the table is created with Delta column mapping. If the table already exists, the create step is skipped.
 
 # COMMAND ----------
 
@@ -27,9 +33,34 @@ from pyspark.sql import functions as F
 from pyspark.sql.window import Window
 
 dbutils.widgets.text("table_name", "workspace.default.online_retail_ii")
-raw = spark.table(dbutils.widgets.get("table_name"))
-raw.createOrReplaceTempView("retail_raw")
+dbutils.widgets.text(
+    "volume_parquet",
+    "/Volumes/workspace/default/my_files/online_retail/online_retail_ii.parquet",
+)
 
+TABLE = dbutils.widgets.get("table_name")
+VOLUME_PARQUET = dbutils.widgets.get("volume_parquet")
+
+if not spark.catalog.tableExists(TABLE):
+    # Column mapping: Delta otherwise rejects the space in `Customer ID`.
+    spark.sql(
+        f"""
+        CREATE TABLE {TABLE}
+        TBLPROPERTIES (
+          'delta.minReaderVersion' = '2',
+          'delta.minWriterVersion' = '5',
+          'delta.columnMapping.mode' = 'name'
+        )
+        AS
+        SELECT * FROM read_files('{VOLUME_PARQUET}', format => 'parquet')
+        """
+    )
+    print("created", TABLE, "from", VOLUME_PARQUET)
+else:
+    print("using existing", TABLE)
+
+raw = spark.table(TABLE)
+raw.createOrReplaceTempView("retail_raw")
 print("columns:", raw.columns)
 raw.printSchema()
 
@@ -82,7 +113,8 @@ display(
     .orderBy("first_ts")
 )
 
-# Repeat (Invoice, StockCode) pairs ⇒ grain is line item, not unique SKU-per-invoice
+# (Invoice, StockCode) is not unique. That does not by itself identify a line —
+# the file has no line-item id. Apparent grain: an invoice transaction line.
 grain = raw.groupBy("Invoice", "StockCode").count()
 display(
     grain.agg(
@@ -98,7 +130,7 @@ display(
 # MAGIC **Overview (fill after the tables)**
 # MAGIC
 # MAGIC - Price column name: **[Price / UnitPrice]** — `line_revenue` is created only after this.
-# MAGIC - Grain: [line item / other].
+# MAGIC - Grain: [invoice transaction line; (Invoice, StockCode) is / is not unique; no explicit line id].
 # MAGIC - Sheet date ranges: [ ]. Overlap is a *suspect* until §3.2 proves it at transaction grain.
 
 # COMMAND ----------
@@ -330,18 +362,30 @@ print("distinct days in Dec 2011:", last.select(F.dayofmonth("InvoiceDate")).dis
 # MAGIC | Neg / zero price | [ ] | Hold out of merchandise revenue if they are adjustments / notes |
 # MAGIC | Missing Customer ID | [ ] | Keep in revenue; exclude from customer metrics |
 # MAGIC | Extreme qty | [ ] | Look for a same-day `C` before ranking products |
-# MAGIC | Alpha stock codes | [ ] | Include or exclude POST / DOT / M / fees from merchandise |
+# MAGIC | Alpha stock codes | [read the §3.5 table] | Then fill `NON_PRODUCT_CODES` below — do not guess |
 # MAGIC | Last month | [ ] | Do not compare a partial December to a full month |
 
 # COMMAND ----------
 
-# Named filters for later cells — not a pipeline. Tune NON_PRODUCT after §3.5.
-NON_PRODUCT = r"^(POST|DOT|M|C2|D|S|BANK CHARGES|ADJUST\d*|AMAZONFEE|CRUK|TEST\d*|gift_\w+|PADS|B)$"
+# Fill AFTER reading the alpha StockCode table in §3.5. Start empty so nothing
+# is excluded on an uninspected regex. Add a code only if you can say what it is.
+#   POST      — if description is postage
+#   DOT       — if description is DOTCOM postage
+#   M         — Manual; inspect before excluding (can be real sales or adjustments)
+#   AMAZONFEE — marketplace fee
+#   C2 / D / S / BANK CHARGES / CRUK / gift_* / B — only if the table supports it
+NON_PRODUCT_CODES = [
+    # "POST",
+    # "DOT",
+]
 
+is_non_product = (
+    F.col("StockCode").isin(NON_PRODUCT_CODES) if NON_PRODUCT_CODES else F.lit(False)
+)
 df = (
     df.withColumn("is_cancel", F.col("invoice_prefix") == "C")
     .withColumn("is_adjust", F.col("invoice_prefix") == "A")
-    .withColumn("is_non_product", F.col("StockCode").rlike(NON_PRODUCT))
+    .withColumn("is_non_product", is_non_product)
     .withColumn("is_zero_price", F.col(PRICE_COL) == 0)
 )
 
@@ -458,7 +502,7 @@ print("SKUs to ~50% / ~80%:", products.filter("cum_share <= 0.50").count(), "/",
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC **Products (fill):** top SKU and share [ ]; tail [ ]; any “top product” that vanished after netting credits [ ]. Confidence [ ]. Caveat: `NON_PRODUCT` is inferred.
+# MAGIC **Products (fill):** top SKU and share [ ]; tail [ ]; any “top product” that vanished after netting credits [ ]. Confidence [ ]. Caveat: only codes listed in `NON_PRODUCT_CODES`.
 
 # COMMAND ----------
 
@@ -535,16 +579,26 @@ display(
 
 display(spark.sql(
     """
+    WITH monthly_returns AS (
+      SELECT date_trunc('month', InvoiceDate) AS month,
+             -SUM(line_revenue) AS return_value
+      FROM returns
+      GROUP BY 1
+    ),
+    monthly_sales AS (
+      SELECT date_trunc('month', InvoiceDate) AS month,
+             SUM(line_revenue) AS gross_sales
+      FROM sales
+      GROUP BY 1
+    )
     SELECT
-      date_trunc('month', r.InvoiceDate) AS month,
-      -SUM(r.line_revenue) / NULLIF(SUM(s.line_revenue), 0) AS return_rate
-    FROM returns r
-    LEFT JOIN (
-      SELECT date_trunc('month', InvoiceDate) AS month, SUM(line_revenue) AS line_revenue
-      FROM sales GROUP BY 1
-    ) s ON date_trunc('month', r.InvoiceDate) = s.month
-    GROUP BY 1
-    ORDER BY 1
+      r.month,
+      r.return_value,
+      s.gross_sales,
+      r.return_value / NULLIF(s.gross_sales, 0) AS return_rate
+    FROM monthly_returns r
+    LEFT JOIN monthly_sales s USING (month)
+    ORDER BY month
     """
 ))  # Bar: x=month, y=return_rate
 
@@ -608,7 +662,7 @@ display(spark.sql(
 # MAGIC - Evidence: [top 10 / SKUs to 50%]
 # MAGIC - Why it matters: [ ]
 # MAGIC - Confidence: [ ]
-# MAGIC - Caveat: `NON_PRODUCT` is inferred
+# MAGIC - Caveat: only codes you listed in `NON_PRODUCT_CODES` after §3.5
 # MAGIC
 # MAGIC **4. Customers — [ ]**
 # MAGIC - Evidence: [concentration; retention]
@@ -629,7 +683,7 @@ display(spark.sql(
 # MAGIC
 # MAGIC - **Last month may be incomplete.** Use `date_max` from `key_facts` before comparing Decembers.
 # MAGIC - **Overlap is conditional.** Rows were removed only if §3.2 proved a 1:1 key match. Calendar overlap by itself was not treated as proof.
-# MAGIC - **Revenue definition is a choice.** Postage, `M`, fees, £0 notes, and `A` rows are out of `trade`. The waterfall is the audit trail.
+# MAGIC - **Revenue definition is a choice.** `A` rows and £0 notes are out of `trade`. Other exclusions are only the StockCodes you listed after §3.5. The waterfall is the audit trail.
 # MAGIC - **Returns are prefix-based.** `C` invoices are credits; they are not matched to originating sales except the large lines we inspect.
 # MAGIC - **Anonymous sales** are in revenue and out of customer metrics.
 # MAGIC - **No cost or margin.** GBP as invoiced. Not a profit statement.
@@ -657,8 +711,11 @@ display(spark.sql(
 # MAGIC
 # MAGIC **Used for:** Databricks cell layout, a first DQ checklist, Spark SQL drafts.
 # MAGIC
-# MAGIC **Rejected:** medallion/pipeline layout; dropping all missing Customer IDs; ranking products on positive quantity only; treating every negative qty as a return; dropping the Dec-2010 window from date overlap alone.
+# MAGIC **Rejected / corrected:**
+# MAGIC - Medallion/pipeline layout; dropping all missing Customer IDs; ranking products on positive quantity only; treating every negative qty as a return; dropping the Dec-2010 window from date overlap alone.
+# MAGIC - A first-draft monthly return-rate query joined monthly sales back onto *line-level* returns, so `SUM(sales)` could multiply the denominator by the number of return rows. Rewrote it to aggregate returns and sales by month first, then join.
+# MAGIC - A pre-baked `NON_PRODUCT` regex. Codes are excluded only after the §3.5 table, and only if I can name what each code is.
 # MAGIC
-# MAGIC **Checks:** every number in §§1 and 5 must appear in a table this notebook computes; overlap must be a full-key join, not a date-range count; extreme-qty rows are inspected, not trusted from `summary()`; claims without a table stay hypotheses.
+# MAGIC **Checks:** every number in §§1 and 5 must appear in a table this notebook computes; overlap must be a full-key join, not a date-range count; SQL joins are checked at the grain of the aggregation; extreme-qty rows are inspected, not trusted from `summary()`; claims without a table stay hypotheses.
 # MAGIC
 # MAGIC _After the run: note anything the assistant drafted that the numbers contradicted._
