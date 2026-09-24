@@ -540,9 +540,10 @@ products = spark.sql(
     """
 ).filter("net_revenue > 0")
 
-w = Window.orderBy(F.desc("net_revenue"))
+prod_total = products.agg(F.sum("net_revenue")).first()[0]
+w = Window.partitionBy(F.lit(1)).orderBy(F.desc("net_revenue"))
 products = products.withColumn("rank", F.row_number().over(w)).withColumn(
-    "cum_share", F.sum("net_revenue").over(w) / F.sum("net_revenue").over(Window.partitionBy())
+    "cum_share", F.sum("net_revenue").over(w) / F.lit(prod_total)
 )
 display(products.limit(15))  # Bar: x=description, y=net_revenue
 
@@ -578,9 +579,10 @@ customers = spark.sql(
     GROUP BY `Customer ID`
     """
 )
-cw = Window.orderBy(F.desc("net_revenue"))
+cust_total = customers.agg(F.sum("net_revenue")).first()[0]
+cw = Window.partitionBy(F.lit(1)).orderBy(F.desc("net_revenue"))
 customers = customers.withColumn("rank", F.row_number().over(cw)).withColumn(
-    "cum_share", F.sum("net_revenue").over(cw) / F.sum("net_revenue").over(Window.partitionBy())
+    "cum_share", F.sum("net_revenue").over(cw) / F.lit(cust_total)
 )
 display(customers.orderBy("rank").limit(10))
 
@@ -663,7 +665,8 @@ geo = spark.sql(
     GROUP BY Country
     """
 )
-geo = geo.withColumn("share", F.col("net_revenue") / F.sum("net_revenue").over(Window.partitionBy()))
+geo_total = geo.agg(F.sum("net_revenue")).first()[0]
+geo = geo.withColumn("share", F.col("net_revenue") / F.lit(geo_total))
 display(geo.orderBy(F.desc("net_revenue")).limit(12))  # Bar: hide UK to see the tail
 
 # COMMAND ----------
@@ -913,13 +916,15 @@ spark.sql(
 spark.sql(
     """
     CREATE OR REPLACE TEMP VIEW dashboard_geography AS
+    WITH totals AS (SELECT SUM(line_revenue) AS all_rev FROM sales)
     SELECT
       Country,
-      SUM(line_revenue) AS net_revenue,
+      SUM(s.line_revenue) AS net_revenue,
       COUNT(DISTINCT Invoice) AS invoices,
       COUNT(DISTINCT `Customer ID`) AS identified_customers,
-      SUM(line_revenue) / SUM(SUM(line_revenue)) OVER () AS revenue_share
-    FROM sales
+      SUM(s.line_revenue) / FIRST(t.all_rev) AS revenue_share
+    FROM sales s
+    CROSS JOIN totals t
     GROUP BY Country
     """
 )
