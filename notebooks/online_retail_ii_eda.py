@@ -719,3 +719,277 @@ display(spark.sql(
 # MAGIC **Checks:** every number in §§1 and 5 must appear in a table this notebook computes; overlap must be a full-key join, not a date-range count; SQL joins are checked at the grain of the aggregation; extreme-qty rows are inspected, not trusted from `summary()`; claims without a table stay hypotheses.
 # MAGIC
 # MAGIC _After the run: note anything the assistant drafted that the numbers contradicted._
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 9. From EDA to a consumption layer (not a rebuild)
+# MAGIC
+# MAGIC This exercise stops at a notebook plus a thin dashboard. The path is:
+# MAGIC
+# MAGIC ```
+# MAGIC Raw dataset
+# MAGIC     ↓
+# MAGIC Data quality / validation
+# MAGIC     ↓
+# MAGIC trade / sales / returns   ← the only metric definitions
+# MAGIC     ↓
+# MAGIC EDA notebook              ← the analytical artifact
+# MAGIC     ↓
+# MAGIC Dashboard views           ← same definitions, no new logic
+# MAGIC ```
+# MAGIC
+# MAGIC There is no Bronze / Silver / Gold here. The EDA is what would *inform* a later production design:
+# MAGIC
+# MAGIC ```
+# MAGIC Sources → Bronze → Silver (canonical transactions) → Gold (governed KPIs)
+# MAGIC                                              ↓
+# MAGIC                         Databricks SQL / Dashboard / Genie
+# MAGIC ```
+# MAGIC
+# MAGIC Unity Catalog would then own access, lineage, and discovery. Silver would need the classifications this notebook already found it must distinguish: **SALE**, **CREDIT**, **ADJUSTMENT**, **FEE / NON-MERCHANDISE**, **UNKNOWN**.
+# MAGIC
+# MAGIC Principle: the EDA informs the architecture; the architecture is not imposed on a 2–3 hour exploratory exercise.
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 10. Dashboard queries
+# MAGIC
+# MAGIC Consumption only. Every metric reads `trade` / `sales` / `returns` from §3. No new filters.
+# MAGIC
+# MAGIC | Query | Chart |
+# MAGIC |---|---|
+# MAGIC | `dashboard_kpis` | KPI row |
+# MAGIC | `dashboard_monthly_revenue` | Line: x=month, y=gross_revenue and net_revenue. Treat `is_partial_period` as a warning, not a decline. |
+# MAGIC | `dashboard_top_products` | Bar: category=description, value=net_revenue |
+# MAGIC | `dashboard_top_customers` | Bar: category=customer_id, value=net_revenue |
+# MAGIC | `dashboard_geography` | Full country mix (includes UK) |
+# MAGIC | `dashboard_geography_ex_uk` | Bar for the chart only — UK removed so the tail is readable |
+# MAGIC | `dashboard_monthly_returns` | Line: x=month, y=return_rate (percent). Built from two monthly aggregates, then joined. |
+# MAGIC
+# MAGIC After this cell runs, build the Databricks dashboard from these result tables. Do not type KPI numbers by hand.
+
+# COMMAND ----------
+
+# Same definitions as §3. Re-declared only so this section is readable; the filters do not change.
+sales.createOrReplaceTempView("sales")
+returns.createOrReplaceTempView("returns")
+trade.createOrReplaceTempView("trade")
+
+spark.sql(
+    """
+    CREATE OR REPLACE TEMP VIEW dashboard_kpis AS
+    SELECT
+      -- net merchandise = validated trade (sales + C-invoice credits)
+      (SELECT SUM(line_revenue) FROM trade) AS net_merchandise_revenue,
+      -- gross = positive merchandise sales only
+      (SELECT SUM(line_revenue) FROM sales) AS gross_merchandise_revenue,
+      -- return/credit value = absolute C-invoice merchandise credits
+      (SELECT -SUM(line_revenue) FROM returns) AS return_credit_value,
+      (SELECT COUNT(DISTINCT Invoice) FROM sales) AS sale_invoices,
+      (SELECT COUNT(DISTINCT `Customer ID`) FROM sales) AS identified_customers,
+      (SELECT -SUM(line_revenue) FROM returns)
+        / (SELECT SUM(line_revenue) FROM sales) AS return_credit_rate
+    """
+)
+
+# Monthly grain from sales + returns, then net = gross - credits.
+# is_partial_period flags Dec 2011 because the source file ends on the 9th — not a decline.
+spark.sql(
+    """
+    CREATE OR REPLACE TEMP VIEW dashboard_monthly_revenue AS
+    WITH monthly_sales AS (
+      SELECT date_trunc('month', InvoiceDate) AS month,
+             SUM(line_revenue) AS gross_revenue,
+             COUNT(DISTINCT Invoice) AS sale_invoices
+      FROM sales
+      GROUP BY 1
+    ),
+    monthly_returns AS (
+      SELECT date_trunc('month', InvoiceDate) AS month,
+             -SUM(line_revenue) AS return_value
+      FROM returns
+      GROUP BY 1
+    )
+    SELECT
+      s.month,
+      s.gross_revenue,
+      COALESCE(r.return_value, 0) AS return_value,
+      s.gross_revenue - COALESCE(r.return_value, 0) AS net_revenue,
+      s.sale_invoices,
+      (s.month = TIMESTAMP '2011-12-01') AS is_partial_period
+    FROM monthly_sales s
+    LEFT JOIN monthly_returns r USING (month)
+    ORDER BY month
+    """
+)
+
+# Net by StockCode so a same-day credit cannot rank as a top product.
+spark.sql(
+    """
+    CREATE OR REPLACE TEMP VIEW dashboard_top_products AS
+    SELECT
+      StockCode,
+      FIRST(Description, TRUE) AS description,
+      SUM(line_revenue) AS net_revenue,
+      SUM(Quantity) AS net_units,
+      COUNT(DISTINCT Invoice) AS invoices
+    FROM trade
+    GROUP BY StockCode
+    ORDER BY net_revenue DESC
+    LIMIT 10
+    """
+)
+
+# Identified accounts only. Anonymous sales stay in dashboard_kpis / monthly revenue.
+spark.sql(
+    """
+    CREATE OR REPLACE TEMP VIEW dashboard_top_customers AS
+    SELECT
+      `Customer ID` AS customer_id,
+      FIRST(Country, TRUE) AS country,
+      SUM(line_revenue) AS net_revenue,
+      COUNT(DISTINCT CASE WHEN NOT is_cancel THEN Invoice END) AS sale_invoices
+    FROM trade
+    WHERE `Customer ID` IS NOT NULL
+    GROUP BY `Customer ID`
+    ORDER BY net_revenue DESC
+    LIMIT 10
+    """
+)
+
+spark.sql(
+    """
+    CREATE OR REPLACE TEMP VIEW dashboard_geography AS
+    SELECT
+      Country,
+      SUM(line_revenue) AS net_revenue,
+      COUNT(DISTINCT Invoice) AS invoices,
+      COUNT(DISTINCT `Customer ID`) AS identified_customers,
+      SUM(line_revenue) / SUM(SUM(line_revenue)) OVER () AS revenue_share
+    FROM sales
+    GROUP BY Country
+    """
+)
+
+# Visualization helper only. UK remains in dashboard_geography and in the KPIs.
+spark.sql(
+    """
+    CREATE OR REPLACE TEMP VIEW dashboard_geography_ex_uk AS
+    SELECT * FROM dashboard_geography
+    WHERE Country <> 'United Kingdom'
+    ORDER BY net_revenue DESC
+    LIMIT 10
+    """
+)
+
+# Aggregate each side to month FIRST, then join. Do not join monthly sales onto return lines.
+spark.sql(
+    """
+    CREATE OR REPLACE TEMP VIEW dashboard_monthly_returns AS
+    WITH monthly_sales AS (
+      SELECT date_trunc('month', InvoiceDate) AS month,
+             SUM(line_revenue) AS gross_sales
+      FROM sales
+      GROUP BY 1
+    ),
+    monthly_returns AS (
+      SELECT date_trunc('month', InvoiceDate) AS month,
+             -SUM(line_revenue) AS return_value
+      FROM returns
+      GROUP BY 1
+    )
+    SELECT
+      s.month,
+      s.gross_sales,
+      COALESCE(r.return_value, 0) AS return_value,
+      COALESCE(r.return_value, 0) / NULLIF(s.gross_sales, 0) AS return_rate,
+      (s.month = TIMESTAMP '2011-12-01') AS is_partial_period
+    FROM monthly_sales s
+    LEFT JOIN monthly_returns r USING (month)
+    ORDER BY month
+    """
+)
+
+print("dashboard views ready")
+display(spark.table("dashboard_kpis"))
+display(spark.table("dashboard_monthly_revenue"))
+display(spark.table("dashboard_top_products"))
+display(spark.table("dashboard_top_customers"))
+display(spark.table("dashboard_geography").orderBy(F.desc("net_revenue")).limit(15))
+display(spark.table("dashboard_geography_ex_uk"))
+display(spark.table("dashboard_monthly_returns"))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Dashboard reconciliation
+# MAGIC
+# MAGIC Compare each dashboard total to the notebook definition. Customer-level revenue **will not** equal merchandise net when `Customer ID` is missing — that is expected, not a break.
+
+# COMMAND ----------
+
+display(spark.sql(
+    """
+    WITH
+    nb AS (
+      SELECT
+        (SELECT SUM(line_revenue) FROM trade) AS merch_net,
+        (SELECT SUM(line_revenue) FROM sales) AS merch_gross,
+        (SELECT -SUM(line_revenue) FROM returns) AS merch_returns,
+        (SELECT COUNT(DISTINCT Invoice) FROM sales) AS sale_invoices,
+        (SELECT COUNT(DISTINCT `Customer ID`) FROM sales) AS identified_customers,
+        (SELECT SUM(line_revenue) FROM trade WHERE `Customer ID` IS NOT NULL) AS identified_net,
+        (SELECT SUM(line_revenue) FROM sales WHERE Country <> 'United Kingdom') AS sales_ex_uk
+    ),
+    dash AS (
+      SELECT
+        (SELECT net_merchandise_revenue FROM dashboard_kpis) AS merch_net,
+        (SELECT gross_merchandise_revenue FROM dashboard_kpis) AS merch_gross,
+        (SELECT return_credit_value FROM dashboard_kpis) AS merch_returns,
+        (SELECT sale_invoices FROM dashboard_kpis) AS sale_invoices,
+        (SELECT identified_customers FROM dashboard_kpis) AS identified_customers,
+        (SELECT SUM(net_revenue) FROM dashboard_monthly_revenue) AS monthly_net,
+        (SELECT SUM(gross_revenue) FROM dashboard_monthly_revenue) AS monthly_gross,
+        (SELECT SUM(return_value) FROM dashboard_monthly_revenue) AS monthly_returns,
+        (SELECT SUM(net_revenue) FROM dashboard_geography) AS geo_sales,
+        (SELECT SUM(net_revenue) FROM dashboard_geography WHERE Country <> 'United Kingdom') AS geo_ex_uk,
+        (SELECT SUM(line_revenue) FROM trade WHERE `Customer ID` IS NOT NULL) AS identified_net
+    )
+    SELECT stack(10,
+      'net merchandise revenue',        nb.merch_net,              dash.merch_net,
+      'gross merchandise revenue',      nb.merch_gross,            dash.merch_gross,
+      'return / credit value',          nb.merch_returns,          dash.merch_returns,
+      'sale invoices',                  nb.sale_invoices,          dash.sale_invoices,
+      'identified customers',           nb.identified_customers,   dash.identified_customers,
+      'monthly net sums to trade net',  nb.merch_net,              dash.monthly_net,
+      'monthly gross sums to sales',    nb.merch_gross,            dash.monthly_gross,
+      'monthly returns sum to credits', nb.merch_returns,          dash.monthly_returns,
+      'geography sums to sales',        nb.merch_gross,            dash.geo_sales,
+      'non-UK geography vs non-UK sales', nb.sales_ex_uk,       dash.geo_ex_uk
+    ) AS (metric, notebook_value, dashboard_value)
+    FROM nb CROSS JOIN dash
+    """
+).select(
+    "metric",
+    "notebook_value",
+    "dashboard_value",
+    (F.col("dashboard_value") - F.col("notebook_value")).alias("difference"),
+    F.when(F.abs(F.col("dashboard_value") - F.col("notebook_value")) < 0.01, "reconcile")
+    .otherwise("break")
+    .alias("status"),
+))
+
+print(
+    "Expected gap (not a break): identified-customer net vs merchandise net = anonymous sales still in the KPIs."
+)
+display(spark.sql(
+    """
+    SELECT
+      (SELECT SUM(line_revenue) FROM trade) AS merchandise_net,
+      (SELECT SUM(line_revenue) FROM trade WHERE `Customer ID` IS NOT NULL) AS identified_customer_net,
+      (SELECT SUM(line_revenue) FROM trade WHERE `Customer ID` IS NULL) AS anonymous_net,
+      (SELECT SUM(net_revenue) FROM dashboard_top_customers) AS top10_customers_net
+    """
+))
