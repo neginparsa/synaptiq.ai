@@ -61,7 +61,10 @@ else:
 
 raw = spark.table(TABLE)
 raw.createOrReplaceTempView("retail_raw")
+PRICE_COL = "Price" if "Price" in raw.columns else "UnitPrice"
+assert PRICE_COL in raw.columns, raw.columns
 print("columns:", raw.columns)
+print("price column (line_revenue is created after the overview tables):", PRICE_COL)
 raw.printSchema()
 
 # COMMAND ----------
@@ -134,9 +137,6 @@ display(
 # MAGIC - Sheet date ranges: [ ]. Overlap is a *suspect* until §3.2 proves it at transaction grain.
 
 # COMMAND ----------
-
-PRICE_COL = "Price" if "Price" in raw.columns else "UnitPrice"
-assert PRICE_COL in raw.columns, raw.columns
 
 raw = raw.withColumn("line_revenue", F.col("Quantity") * F.col(PRICE_COL))
 raw.createOrReplaceTempView("retail_raw")
